@@ -24,7 +24,7 @@ class ProviderConfig:
 
 PROVIDERS: dict[str, ProviderConfig] = {
     "openai": ProviderConfig("openai", "OPENAI_API_KEY", "gpt-4o-mini"),
-    "anthropic": ProviderConfig("anthropic", "ANTHROPIC_API_KEY", "claude-3-5-haiku-latest"),
+    "anthropic": ProviderConfig("anthropic", "ANTHROPIC_API_KEY", "claude-haiku-4-5-20251001"),
     "google": ProviderConfig("google", "GOOGLE_API_KEY", "gemini-2.0-flash"),
     "groq": ProviderConfig("groq", "GROQ_API_KEY", "llama-3.1-8b-instant"),
 }
