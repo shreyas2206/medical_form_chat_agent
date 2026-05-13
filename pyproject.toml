@@ -1,0 +1,36 @@
+[project]
+name = "medical-form-chat-agent"
+version = "0.1.0"
+description = "A structured deterministic medical intake chatbot — three LangGraph implementations"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Core frameworks
+    "langchain>=0.3",
+    "langgraph>=0.3",
+
+    # LLM provider integrations — swap by choosing the relevant class at import time
+    "langchain-openai>=0.3",       # ChatOpenAI
+    "langchain-anthropic>=0.3",    # ChatAnthropic
+    "langchain-google-genai>=2.0", # ChatGoogleGenerativeAI
+    "langchain-groq>=0.3",         # ChatGroq
+
+    # Utilities
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+medical-form-smoke-test = "medical_form_chat_agent.smoke_test:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "ipython",   # for interactive exploration during development
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/medical_form_chat_agent"]
