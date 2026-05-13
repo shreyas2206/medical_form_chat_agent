@@ -1,3 +1,5 @@
 .venv
 uv.lock
 .env
+.claude
+claude.md
