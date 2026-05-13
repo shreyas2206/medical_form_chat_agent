@@ -53,6 +53,57 @@ The ReAct clarification sub-loop (for when a patient doesn't understand a questi
 
 ---
 
+## Getting Started
+
+### Prerequisites
+
+- **Python 3.11+** (installed on your system)
+- **`uv` package manager** (lightweight, fast Python project manager)
+
+### Setup
+
+1. **Install `uv` if you don't have it:**
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+   Or visit [uv docs](https://docs.astral.sh/uv/) for other installation methods.
+
+2. **Clone this repository and navigate to it:**
+   ```bash
+   git clone <repo-url>
+   cd medical_form_chat_agent
+   ```
+
+3. **Sync dependencies and set up the virtual environment:**
+   ```bash
+   uv sync
+   ```
+   This creates a `.venv/` directory with all required packages (LangChain, LangGraph, provider SDKs, etc.).
+
+4. **Create a `.env` file in the project root with your API keys:**
+   ```bash
+   cp .env.example .env  # or create it manually
+   ```
+   Then edit `.env` and add the keys you'll use. Example:
+   ```
+   ANTHROPIC_API_KEY=sk-ant-...
+   OPENAI_API_KEY=sk-...
+   GOOGLE_API_KEY=...
+   GROQ_API_KEY=...
+   ```
+   Only include keys for providers you plan to use. The smoke test will skip any provider with a missing key.
+
+5. **Run the smoke test to verify setup:**
+   ```bash
+   uv run python smoke_test.py
+   ```
+   Or test a single provider:
+   ```bash
+   uv run python smoke_test.py --provider anthropic
+   ```
+
+---
+
 ## The Three Approaches
 
 ### Approach 1 — LangChain only (`01_langchain/`)
