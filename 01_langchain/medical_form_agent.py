@@ -12,10 +12,13 @@ Workarounds visible here (intentional — they motivate Approach 2):
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
@@ -99,6 +102,20 @@ FIELD_LABELS: dict[str, str] = {
     "smoking_status":   "smoking status",
 }
 
+FIELD_CONSTRAINTS: dict[str, str] = {
+    "pain_level": (
+        "The value MUST be a single integer 0–10. "
+        "If the patient described pain in words (e.g. 'sharp', 'quite bad') without giving a number, "
+        "set extracted=false and needs_clarification=false so a targeted reask is issued. "
+        "Only use needs_clarification=true if the patient is confused about what the scale means."
+    ),
+    "dob": (
+        "The value must be a recognisable calendar date. "
+        "If the patient gave only a partial date (e.g. month and day but no year), "
+        "set extracted=false and needs_clarification=false so a follow-up reask is issued."
+    ),
+}
+
 
 @dataclass
 class AgentState:
@@ -109,6 +126,8 @@ class AgentState:
     last_question: str | None = None
     user_input: str | None = None
     status: Literal["running", "complete", "rejected"] = "running"
+    reask_hint: str = ""
+    field_history: list = field(default_factory=list)  # [{"question", "reply"}] for current field
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +264,41 @@ def _parse_json(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Field-level validation — deterministic Python, runs after LLM extraction
+# ---------------------------------------------------------------------------
+
+_DOB_FORMATS = [
+    "%d %b %Y", "%d %B %Y",       # 15 Mar 1980 / 15 March 1980
+    "%Y-%m-%d",                    # 1980-03-15
+    "%d/%m/%Y", "%m/%d/%Y",        # 15/03/1980 or 03/15/1980
+    "%d-%m-%Y",                    # 15-03-1980
+    "%B %d, %Y", "%b %d, %Y",     # March 15, 1980
+    "%d %b %y", "%d %B %y",       # 15 Mar 80
+]
+
+
+def _validate_field_value(field: str, value: str) -> tuple[bool, str]:
+    """Return (is_valid, hint). Hint is shown to the reask LLM when invalid."""
+    if field == "dob":
+        for fmt in _DOB_FORMATS:
+            try:
+                datetime.datetime.strptime(value.strip(), fmt)
+                return True, ""
+            except ValueError:
+                continue
+        return False, f"{value!r} is not a recognisable or valid date (e.g. 30 Feb does not exist)"
+    if field == "pain_level":
+        m = re.search(r"\b(\d+(?:\.\d+)?)\b", value)
+        if m:
+            n = float(m.group(1))
+            if 0 <= n <= 10:
+                return True, ""
+            return False, f"pain level {n} is outside the 0–10 scale"
+        return False, "could not find a number between 0 and 10 in the answer"
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
 # Nodes — all take (state, log, [llm]) and return (state, ...) or state
 # ---------------------------------------------------------------------------
 
@@ -253,10 +307,12 @@ def node_decide_field(state: AgentState, log: StepLogger) -> AgentState:
     for f in FIELDS:
         if state.form[f] is None:
             state.current_field = f
+            state.field_history = []
             log.routing(f"next field = {f}")
             log.node_exit("decide_field")
             return state
     state.current_field = None
+    state.field_history = []
     log.routing("all fields complete")
     log.node_exit("decide_field")
     return state
@@ -316,17 +372,31 @@ def node_extract(
 ) -> tuple[AgentState, Literal["extracted", "reask", "clarify"]]:
     log.node_enter("extract")
     label = FIELD_LABELS[state.current_field]
+
+    state.field_history = state.field_history + [
+        {"question": state.last_question, "reply": state.user_input}
+    ]
+    history_str = "\n".join(
+        f"  Q: {h['question']}\n  A: {h['reply']}" for h in state.field_history
+    )
+
+    constraint = FIELD_CONSTRAINTS.get(state.current_field, "")
+    constraint_line = f"Field constraint: {constraint}\n" if constraint else ""
     messages = [
         SystemMessage(content=(
-            "You are extracting a single field from a patient's free-text reply in a "
-            "medical intake form. If the reply clearly provides the value, extract and "
-            "normalise it. Respond with JSON only:\n"
-            '{"extracted": true/false, "value": "...", "needs_clarification": true/false, "reason": "..."}'
+            "You are extracting a single field from a patient's replies in a medical "
+            "intake form. The patient may have answered across multiple turns — combine "
+            "them if together they form a complete answer. Extract and normalise the "
+            "value. Respond with JSON only:\n"
+            '{"extracted": true/false, "value": "...", "needs_clarification": true/false, "reason": "..."}\n\n'
+            "Use needs_clarification=true only when the patient is genuinely confused about "
+            "what is being asked. Use needs_clarification=false (triggering a simple reask) "
+            "when the answer is in the wrong format or incomplete."
         )),
         HumanMessage(content=(
             f"Field: {label}\n"
-            f"Question asked: {state.last_question}\n"
-            f"Patient reply: {state.user_input}"
+            f"{constraint_line}"
+            f"Conversation so far for this field:\n{history_str}"
         )),
     ]
     response = llm.invoke(messages)
@@ -341,7 +411,14 @@ def node_extract(
 
     if result.get("extracted") and result.get("value"):
         value = str(result["value"])
+        is_valid, hint = _validate_field_value(state.current_field, value)
+        if not is_valid:
+            state.reask_hint = hint
+            log.routing("reask", hint)
+            log.node_exit("extract")
+            return state, "reask"
         state.form[state.current_field] = value
+        state.reask_hint = ""
         log.field_saved(state.current_field, value)
         log.node_exit("extract")
         return state, "extracted"
@@ -351,7 +428,8 @@ def node_extract(
         log.node_exit("extract")
         return state, "clarify"
 
-    log.routing("reask", result.get("reason", ""))
+    state.reask_hint = result.get("reason", "")
+    log.routing("reask", state.reask_hint)
     log.node_exit("extract")
     return state, "reask"
 
@@ -366,6 +444,9 @@ def node_clarify(
     log.node_enter("clarify")
     label = FIELD_LABELS[state.current_field]
     bound_llm = llm.bind_tools(list(_REACT_TOOLS.values()))
+    history_str = "\n".join(
+        f"  Q: {h['question']}\n  A: {h['reply']}" for h in state.field_history
+    )
     messages = [
         SystemMessage(content=(
             "You are a GP receptionist helping a confused patient fill in an intake form. "
@@ -374,9 +455,8 @@ def node_clarify(
         )),
         HumanMessage(content=(
             f"Field: {label}\n"
-            f"Previous question: {state.last_question!r}\n"
-            f"Patient reply: {state.user_input!r}\n"
-            "Think step by step about why the patient might be confused, then ask a better question."
+            f"Conversation so far for this field:\n{history_str}\n"
+            "Think step by step about what information is still missing or unclear, then ask a better question."
         )),
     ]
 
@@ -414,15 +494,20 @@ def node_reask(
     state: AgentState, log: StepLogger, llm: BaseChatModel
 ) -> tuple[AgentState, str]:
     log.node_enter("reask")
+    hint_line = f"Validation note: {state.reask_hint}\n" if state.reask_hint else ""
+    history_str = "\n".join(
+        f"  Q: {h['question']}\n  A: {h['reply']}" for h in state.field_history
+    )
     messages = [
         SystemMessage(content=(
-            "You are a GP receptionist. The patient's reply was unclear. "
-            "Politely ask the same question again in a different way. One sentence only."
+            "You are a GP receptionist. The patient's reply was unclear or invalid. "
+            "Politely explain what was wrong and ask a focused follow-up question. One or two sentences only."
         )),
         HumanMessage(content=(
-            f"Original question: {state.last_question}\n"
-            f"Patient reply: {state.user_input}\n"
-            f"Field needed: {FIELD_LABELS[state.current_field]}"
+            f"Field needed: {FIELD_LABELS[state.current_field]}\n"
+            f"Conversation so far for this field:\n{history_str}\n"
+            f"{hint_line}"
+            "What should the agent ask next to get a valid answer?"
         )),
     ]
     response = llm.invoke(messages)
@@ -467,12 +552,20 @@ class MedicalFormAgent:
         self._clf = _build_llm(self.config.provider, classifier)
         self._log = StepLogger(verbose=self.verbose)
         self._state: AgentState | None = None
+        self._turns: list[dict] = []
+        self._session_id: str = uuid.uuid4().hex[:8]
+        self._started_at: str = datetime.datetime.now().isoformat()
+        self._pending_question: str | None = None
 
     def start(self) -> str:
         """Begin a new intake session. Returns the first question."""
+        self._turns = []
+        self._session_id = uuid.uuid4().hex[:8]
+        self._started_at = datetime.datetime.now().isoformat()
         self._state = AgentState()
         self._state = node_decide_field(self._state, self._log)
         self._state, question = node_generate_question(self._state, self._log, self._llm)
+        self._pending_question = question
         return question
 
     def reply(self, user_input: str) -> str:
@@ -486,6 +579,7 @@ class MedicalFormAgent:
         if self._state.status != "running":
             return "This intake session has already ended."
 
+        field_before = self._state.current_field
         self._state.user_input = user_input
 
         # --- sanitise ---
@@ -493,10 +587,20 @@ class MedicalFormAgent:
 
         if verdict == "injection":
             self._state, msg = node_reject(self._state, self._log)
+            self._turns.append({
+                "field": field_before, "question": self._pending_question,
+                "patient_reply": user_input, "outcome": "rejected", "agent_response": msg,
+            })
+            self._pending_question = msg
             return msg
 
         if verdict == "clarify":
             self._state, question = node_clarify(self._state, self._log, self._llm)
+            self._turns.append({
+                "field": field_before, "question": self._pending_question,
+                "patient_reply": user_input, "outcome": "clarify", "agent_response": question,
+            })
+            self._pending_question = question
             return question
 
         # --- extract ---
@@ -504,10 +608,20 @@ class MedicalFormAgent:
 
         if verdict == "clarify":
             self._state, question = node_clarify(self._state, self._log, self._llm)
+            self._turns.append({
+                "field": field_before, "question": self._pending_question,
+                "patient_reply": user_input, "outcome": "clarify", "agent_response": question,
+            })
+            self._pending_question = question
             return question
 
         if verdict == "reask":
             self._state, question = node_reask(self._state, self._log, self._llm)
+            self._turns.append({
+                "field": field_before, "question": self._pending_question,
+                "patient_reply": user_input, "outcome": "reask", "agent_response": question,
+            })
+            self._pending_question = question
             return question
 
         # --- advance ---
@@ -515,10 +629,46 @@ class MedicalFormAgent:
 
         if self._state.current_field is None:
             self._state, summary = node_conclude(self._state, self._log)
+            self._turns.append({
+                "field": field_before, "question": self._pending_question,
+                "patient_reply": user_input, "outcome": "complete", "agent_response": summary,
+            })
+            self._pending_question = summary
             return summary
 
         self._state, question = node_generate_question(self._state, self._log, self._llm)
+        self._turns.append({
+            "field": field_before, "question": self._pending_question,
+            "patient_reply": user_input, "outcome": "extracted", "agent_response": question,
+        })
+        self._pending_question = question
         return question
+
+    def dump(self, directory: str = "logs") -> str:
+        """
+        Write the session (conversation log + completed form) to a JSON file.
+        Returns the path of the file written.
+        """
+        if self._state is None:
+            raise RuntimeError("Call start() before dump().")
+        Path(directory).mkdir(parents=True, exist_ok=True)
+        reasoning_model, _ = self.config.models()
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"session_{timestamp}_{self._session_id}.json"
+        filepath = Path(directory) / filename
+        payload = {
+            "session_id": self._session_id,
+            "started_at": self._started_at,
+            "ended_at": datetime.datetime.now().isoformat(),
+            "provider": self.config.provider.value,
+            "model": reasoning_model,
+            "status": self._state.status,
+            "form": self._state.form,
+            "conversation": self._turns,
+        }
+        with open(filepath, "w") as f:
+            json.dump(payload, f, indent=2)
+        return str(filepath)
 
     @property
     def state(self) -> AgentState | None:
@@ -574,6 +724,8 @@ def main() -> None:
             print("[Form complete]")
         elif agent.state.status == "rejected":
             print("[Session terminated — invalid input detected]")
+        path = agent.dump()
+        print(f"[Session saved → {path}]")
 
 
 if __name__ == "__main__":
