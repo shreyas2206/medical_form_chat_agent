@@ -3,3 +3,4 @@ uv.lock
 .env
 .claude
 CLAUDE.md
+logs/
